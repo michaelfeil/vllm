@@ -21,8 +21,17 @@
 #include "attention_generic.cuh"
 #include "dtype_float32.cuh"
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#ifndef USE_ROCM
+  #include <cuda_bf16.h>
+  #include <cuda_fp16.h>
+#else
+  #include <hip/hip_bf16.h>
+  #include <hip/hip_fp16.h>
+
+  typedef __hip_bfloat162 __nv_bfloat162;
+  typedef __hip_bfloat16 __nv_bfloat16;
+#endif
+
 #include <stdint.h>
 
 namespace vllm {
@@ -98,7 +107,11 @@ inline __device__ __nv_bfloat16 add(__nv_bfloat16 a, __nv_bfloat16 b) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
   assert(false);
 #else
-  return a + b;
+  #ifndef USE_ROCM
+    return a + b;
+  #else
+    return __hadd(a, b);
+  #endif
 #endif
 }
 
@@ -417,6 +430,21 @@ inline __device__ void from_float(bf16_8_t& dst, Float8_ src) {
   dst.y = __float22bfloat162_rn(src.y);
   dst.z = __float22bfloat162_rn(src.z);
   dst.w = __float22bfloat162_rn(src.w);
+#endif
+}
+
+// From bfloat16 to float32.
+inline __device__ float to_float(__nv_bfloat16 u) {
+  return __bfloat162float(u);
+}
+
+// Zero-out a variable.
+inline __device__ void zero(__nv_bfloat16& dst) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  assert(false);
+#else
+  // Same as CUDART_ZERO_BF16 introduced in CUDA 12.2.
+  dst = __ushort_as_bfloat16((unsigned short)0x0000U);
 #endif
 }
 

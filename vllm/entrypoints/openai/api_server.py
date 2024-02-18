@@ -1,301 +1,199 @@
-# Adapted from https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/serve/openai_api_server.py
-
 import argparse
-from http import HTTPStatus
+import asyncio
 import json
-import time
-from typing import AsyncGenerator, Dict, List, Optional
+from contextlib import asynccontextmanager
+import os
+import importlib
+import inspect
 
+from aioprometheus import MetricsMiddleware
+from aioprometheus.asgi.starlette import metrics
 import fastapi
-from fastapi import BackgroundTasks, Request
+import uvicorn
+from http import HTTPStatus
+from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-import uvicorn
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
-from vllm.entrypoints.openai.protocol import (
-    CompletionRequest, CompletionResponse, CompletionResponseChoice,
-    CompletionResponseStreamChoice, CompletionStreamResponse, ErrorResponse,
-    LogProbs, ModelCard, ModelList, ModelPermission, UsageInfo)
+from vllm.engine.metrics import add_global_metrics_labels
+from vllm.entrypoints.openai.protocol import CompletionRequest, ChatCompletionRequest, ErrorResponse
 from vllm.logger import init_logger
-from vllm.outputs import RequestOutput
-from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import get_tokenizer
-from vllm.utils import random_uuid
+from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+from vllm.entrypoints.openai.serving_engine import LoRA
 
-TIMEOUT_KEEP_ALIVE = 5 # seconds
+TIMEOUT_KEEP_ALIVE = 5  # seconds
 
+openai_serving_chat: OpenAIServingChat = None
+openai_serving_completion: OpenAIServingCompletion = None
 logger = init_logger(__name__)
-served_model = None
-app = fastapi.FastAPI()
 
 
-def create_error_response(status_code: HTTPStatus,
-                          message: str) -> JSONResponse:
-    return JSONResponse(
-        ErrorResponse(message=message, type="invalid_request_error").dict(),
-        status_code=status_code.value
+@asynccontextmanager
+async def lifespan(app: fastapi.FastAPI):
+
+    async def _force_log():
+        while True:
+            await asyncio.sleep(10)
+            await engine.do_log_stats()
+
+    if not engine_args.disable_log_stats:
+        asyncio.create_task(_force_log())
+
+    yield
+
+
+app = fastapi.FastAPI(lifespan=lifespan)
+
+
+class LoRAParserAction(argparse.Action):
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        lora_list = []
+        for item in values:
+            name, path = item.split('=')
+            lora_list.append(LoRA(name, path))
+        setattr(namespace, self.dest, lora_list)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="vLLM OpenAI-Compatible RESTful API server.")
+    parser.add_argument("--host", type=str, default=None, help="host name")
+    parser.add_argument("--port", type=int, default=8000, help="port number")
+    parser.add_argument("--allow-credentials",
+                        action="store_true",
+                        help="allow credentials")
+    parser.add_argument("--allowed-origins",
+                        type=json.loads,
+                        default=["*"],
+                        help="allowed origins")
+    parser.add_argument("--allowed-methods",
+                        type=json.loads,
+                        default=["*"],
+                        help="allowed methods")
+    parser.add_argument("--allowed-headers",
+                        type=json.loads,
+                        default=["*"],
+                        help="allowed headers")
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help=
+        "If provided, the server will require this key to be presented in the header."
     )
+    parser.add_argument("--served-model-name",
+                        type=str,
+                        default=None,
+                        help="The model name used in the API. If not "
+                        "specified, the model name will be the same as "
+                        "the huggingface name.")
+    parser.add_argument(
+        "--lora-modules",
+        type=str,
+        default=None,
+        nargs='+',
+        action=LoRAParserAction,
+        help=
+        "LoRA module configurations in the format name=path. Multiple modules can be specified."
+    )
+    parser.add_argument("--chat-template",
+                        type=str,
+                        default=None,
+                        help="The file path to the chat template, "
+                        "or the template in single-line form "
+                        "for the specified model")
+    parser.add_argument("--response-role",
+                        type=str,
+                        default="assistant",
+                        help="The role name to return if "
+                        "`request.add_generation_prompt=true`.")
+    parser.add_argument("--ssl-keyfile",
+                        type=str,
+                        default=None,
+                        help="The file path to the SSL key file")
+    parser.add_argument("--ssl-certfile",
+                        type=str,
+                        default=None,
+                        help="The file path to the SSL cert file")
+    parser.add_argument(
+        "--root-path",
+        type=str,
+        default=None,
+        help="FastAPI root_path when app is behind a path based routing proxy")
+    parser.add_argument(
+        "--middleware",
+        type=str,
+        action="append",
+        default=[],
+        help="Additional ASGI middleware to apply to the app. "
+        "We accept multiple --middleware arguments. "
+        "The value should be an import path. "
+        "If a function is provided, vLLM will add it to the server using @app.middleware('http'). "
+        "If a class is provided, vLLM will add it to the server using app.add_middleware(). "
+    )
+
+    parser = AsyncEngineArgs.add_cli_args(parser)
+    return parser.parse_args()
+
+
+app.add_middleware(MetricsMiddleware)  # Trace HTTP server metrics
+app.add_route("/metrics", metrics)  # Exposes HTTP metrics
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc):
-    return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+async def validation_exception_handler(_, exc):
+    err = openai_serving_chat.create_error_response(message=str(exc))
+    return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 
-async def check_model(request) -> Optional[JSONResponse]:
-    if request.model == served_model:
-        return
-    ret = create_error_response(
-        HTTPStatus.NOT_FOUND,
-        f"The model `{request.model}` does not exist.",
-    )
-    return ret
+@app.get("/health")
+async def health() -> Response:
+    """Health check."""
+    return Response(status_code=200)
 
 
 @app.get("/v1/models")
 async def show_available_models():
-    """Show available models. Right now we only have one model."""
-    model_cards = [ModelCard(id=served_model, root=served_model,
-                             permission=[ModelPermission()])]
-    return ModelList(data=model_cards)
+    models = await openai_serving_chat.show_available_models()
+    return JSONResponse(content=models.model_dump())
 
 
-def create_logprobs(token_ids: List[int],
-                    id_logprobs: List[Dict[int, float]],
-                    initial_text_offset: int = 0) -> LogProbs:
-    """Create OpenAI-style logprobs."""
-    logprobs = LogProbs()
-    last_token_len = 0
-    for token_id, id_logprob in zip(token_ids, id_logprobs):
-        token = tokenizer.convert_ids_to_tokens(token_id)
-        logprobs.tokens.append(token)
-        logprobs.token_logprobs.append(id_logprob[token_id])
-        if len(logprobs.text_offset) == 0:
-            logprobs.text_offset.append(initial_text_offset)
-        else:
-            logprobs.text_offset.append(logprobs.text_offset[-1] + last_token_len)
-        last_token_len = len(token)
-
-        logprobs.top_logprobs.append(
-            {tokenizer.convert_ids_to_tokens(i): p
-             for i, p in id_logprob.items()})
-    return logprobs
+@app.post("/v1/chat/completions")
+async def create_chat_completion(request: ChatCompletionRequest,
+                                 raw_request: Request):
+    generator = await openai_serving_chat.create_chat_completion(
+        request, raw_request)
+    if isinstance(generator, ErrorResponse):
+        return JSONResponse(content=generator.model_dump(),
+                            status_code=generator.code)
+    if request.stream:
+        return StreamingResponse(content=generator,
+                                 media_type="text/event-stream")
+    else:
+        return JSONResponse(content=generator.model_dump())
 
 
 @app.post("/v1/completions")
-async def create_completion(raw_request: Request):
-    """Completion API similar to OpenAI's API.
-
-    See https://platform.openai.com/docs/api-reference/completions/create
-    for the API specification. This API mimics the OpenAI Completion API.
-
-    NOTE: Currently we do not support the following features:
-        - echo (since the vLLM engine does not currently support
-          getting the logprobs of prompt tokens)
-        - suffix (the language models we currently support do not support
-          suffix)
-        - logit_bias (to be supported by vLLM engine)
-    """
-    request = CompletionRequest(**await raw_request.json())
-    logger.info(f"Received completion request: {request}")
-
-    error_check_ret = await check_model(request)
-    if error_check_ret is not None:
-        return error_check_ret
-
-    if request.echo:
-        # We do not support echo since the vLLM engine does not
-        # currently support getting the logprobs of prompt tokens.
-        return create_error_response(HTTPStatus.BAD_REQUEST,
-                                     "echo is not currently supported")
-
-    if request.suffix is not None:
-        # The language models we currently support do not support suffix.
-        return create_error_response(HTTPStatus.BAD_REQUEST,
-                                    "suffix is not currently supported")
-
-    if request.logit_bias is not None:
-        # TODO: support logit_bias in vLLM engine.
-        return create_error_response(HTTPStatus.BAD_REQUEST,
-                                     "logit_bias is not currently supported")
-
-    model_name = request.model
-    request_id = f"cmpl-{random_uuid()}"
-    prompt = request.prompt
-    created_time = int(time.time())
-    try:
-        sampling_params = SamplingParams(
-            n=request.n,
-            best_of=request.best_of,
-            presence_penalty=request.presence_penalty,
-            frequency_penalty=request.frequency_penalty,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            stop=request.stop,
-            ignore_eos=request.ignore_eos,
-            max_tokens=request.max_tokens,
-            logprobs=request.logprobs,
-            use_beam_search=request.use_beam_search,
-        )
-    except ValueError as e:
-        return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
-
-    result_generator = engine.generate(prompt, sampling_params,
-                                       request_id)
-
-    # Similar to the OpenAI API, when n != best_of, we do not stream the
-    # results. In addition, we do not stream the results when use beam search.
-    stream = (request.stream and
-              (request.best_of is None or request.n == request.best_of) and
-              not request.use_beam_search)
-
-    async def abort_request() -> None:
-        await engine.abort(request_id)
-
-    def create_stream_response_json(index: int,
-                                    text: str,
-                                    logprobs: Optional[LogProbs] = None,
-                                    finish_reason: Optional[str] = None) -> str:
-        choice_data = CompletionResponseStreamChoice(
-            index=index,
-            text=text,
-            logprobs=logprobs,
-            finish_reason=finish_reason,
-        )
-        response = CompletionStreamResponse(
-            id=request_id,
-            created=created_time,
-            model=model_name,
-            choices=[choice_data],
-        )
-        response_json = response.json(ensure_ascii=False)
-
-        return response_json
-
-    async def completion_stream_generator() -> AsyncGenerator[str, None]:
-        previous_texts = [""] * request.n
-        previous_num_tokens = [0] * request.n
-        async for res in result_generator:
-            res: RequestOutput
-            for output in res.outputs:
-                i = output.index
-                delta_text = output.text[len(previous_texts[i]):]
-                if request.logprobs is not None:
-                    logprobs = create_logprobs(
-                        output.token_ids[previous_num_tokens[i]:],
-                        output.logprobs[previous_num_tokens[i]:],
-                        len(previous_texts[i]))
-                else:
-                    logprobs = None
-                previous_texts[i] = output.text
-                previous_num_tokens[i] = len(output.token_ids)
-                response_json = create_stream_response_json(
-                    index=i,
-                    text=delta_text,
-                    logprobs=logprobs,
-                )
-                yield f"data: {response_json}\n\n"
-                if output.finish_reason is not None:
-                    logprobs = LogProbs() if request.logprobs is not None else None
-                    response_json = create_stream_response_json(
-                        index=i,
-                        text="",
-                        logprobs=logprobs,
-                        finish_reason=output.finish_reason,
-                    )
-                    yield f"data: {response_json}\n\n"
-            yield "data: [DONE]\n\n"
-
-    # Streaming response
-    if stream:
-        background_tasks = BackgroundTasks()
-        # Abort the request if the client disconnects.
-        background_tasks.add_task(abort_request)
-        return StreamingResponse(completion_stream_generator(),
-                                 media_type="text/event-stream",
-                                 background=background_tasks)
-
-    # Non-streaming response
-    final_res: RequestOutput = None
-    async for res in result_generator:
-        if await raw_request.is_disconnected():
-            # Abort the request if the client disconnects.
-            await abort_request()
-            return create_error_response(HTTPStatus.BAD_REQUEST,
-                                         "Client disconnected")
-        final_res = res
-    assert final_res is not None
-    choices = []
-    for output in final_res.outputs:
-        if request.logprobs is not None:
-            logprobs = create_logprobs(output.token_ids, output.logprobs)
-        else:
-            logprobs = None
-        choice_data = CompletionResponseChoice(
-            index=output.index,
-            text=output.text,
-            logprobs=logprobs,
-            finish_reason=output.finish_reason,
-        )
-        choices.append(choice_data)
-
-    num_prompt_tokens = len(final_res.prompt_token_ids)
-    num_generated_tokens = sum(len(output.token_ids)
-                               for output in final_res.outputs)
-    usage = UsageInfo(
-        prompt_tokens=num_prompt_tokens,
-        completion_tokens=num_generated_tokens,
-        total_tokens=num_prompt_tokens + num_generated_tokens,
-    )
-    response = CompletionResponse(
-        id=request_id,
-        created=created_time,
-        model=model_name,
-        choices=choices,
-        usage=usage,
-    )
-
+async def create_completion(request: CompletionRequest, raw_request: Request):
+    generator = await openai_serving_completion.create_completion(
+        request, raw_request)
+    if isinstance(generator, ErrorResponse):
+        return JSONResponse(content=generator.model_dump(),
+                            status_code=generator.code)
     if request.stream:
-        # When user requests streaming but we don't stream, we still need to
-        # return a streaming response with a single event.
-        response_json = response.json(ensure_ascii=False)
-        async def fake_stream_generator() -> AsyncGenerator[str, None]:
-            yield f"data: {response_json}\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(fake_stream_generator(),
+        return StreamingResponse(content=generator,
                                  media_type="text/event-stream")
-
-    return response
+    else:
+        return JSONResponse(content=generator.model_dump())
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="vLLM OpenAI-Compatible RESTful API server."
-    )
-    parser.add_argument("--host", type=str, default="localhost", help="host name")
-    parser.add_argument("--port", type=int, default=8000, help="port number")
-    parser.add_argument(
-        "--allow-credentials", action="store_true", help="allow credentials"
-    )
-    parser.add_argument(
-        "--allowed-origins", type=json.loads, default=["*"], help="allowed origins"
-    )
-    parser.add_argument(
-        "--allowed-methods", type=json.loads, default=["*"], help="allowed methods"
-    )
-    parser.add_argument(
-        "--allowed-headers", type=json.loads, default=["*"], help="allowed headers"
-    )
-    parser.add_argument("--served-model-name", type=str, default=None,
-                        help="The model name used in the API. If not specified, "
-                             "the model name will be the same as the "
-                             "huggingface name.")
-    parser = AsyncEngineArgs.add_cli_args(parser)
-    args = parser.parse_args()
+    args = parse_args()
 
     app.add_middleware(
         CORSMiddleware,
@@ -305,15 +203,53 @@ if __name__ == "__main__":
         allow_headers=args.allowed_headers,
     )
 
+    if token := os.environ.get("VLLM_API_KEY") or args.api_key:
+
+        @app.middleware("http")
+        async def authentication(request: Request, call_next):
+            if not request.url.path.startswith("/v1"):
+                return await call_next(request)
+            if request.headers.get("Authorization") != "Bearer " + token:
+                return JSONResponse(content={"error": "Unauthorized"},
+                                    status_code=401)
+            return await call_next(request)
+
+    for middleware in args.middleware:
+        module_path, object_name = middleware.rsplit(".", 1)
+        imported = getattr(importlib.import_module(module_path), object_name)
+        if inspect.isclass(imported):
+            app.add_middleware(imported)
+        elif inspect.iscoroutinefunction(imported):
+            app.middleware("http")(imported)
+        else:
+            raise ValueError(
+                f"Invalid middleware {middleware}. Must be a function or a class."
+            )
+
     logger.info(f"args: {args}")
 
-    served_model = args.served_model_name or args.model
+    if args.served_model_name is not None:
+        served_model = args.served_model_name
+    else:
+        served_model = args.model
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
+    openai_serving_chat = OpenAIServingChat(engine, served_model,
+                                            args.response_role,
+                                            args.lora_modules,
+                                            args.chat_template)
+    openai_serving_completion = OpenAIServingCompletion(
+        engine, served_model, args.lora_modules)
 
-    # A separate tokenizer to map token IDs to strings.
-    tokenizer = get_tokenizer(engine_args.tokenizer, engine_args.tokenizer_mode)
+    # Register labels for metrics
+    add_global_metrics_labels(model_name=engine_args.model)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info",
-                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+    app.root_path = args.root_path
+    uvicorn.run(app,
+                host=args.host,
+                port=args.port,
+                log_level="info",
+                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile)

@@ -35,7 +35,8 @@ class LogicalTokenBlock:
 
     def append_tokens(self, token_ids: List[int]) -> None:
         assert len(token_ids) <= self.get_num_empty_slots()
-        self.token_ids[self.num_tokens:self.num_tokens + len(token_ids)] = token_ids
+        curr_idx = self.num_tokens
+        self.token_ids[curr_idx:curr_idx + len(token_ids)] = token_ids
         self.num_tokens += len(token_ids)
 
     def get_token_ids(self) -> List[int]:
@@ -65,3 +66,7 @@ class PhysicalTokenBlock:
         return (f'PhysicalTokenBlock(device={self.device}, '
                 f'block_number={self.block_number}, '
                 f'ref_count={self.ref_count})')
+
+
+# Mapping: logical block number -> physical block.
+BlockTable = List[PhysicalTokenBlock]
